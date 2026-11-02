@@ -159,6 +159,9 @@ pub struct PrefixKVCacheManager {
     pub rolling_cache: HashMap<usize, CachedLayerKV>,
     /// Current diffusion step counter.
     pub step_counter: usize,
+    /// Optional prefetched `(K, V)` slot for double-buffered async layer prefetching.
+    #[serde(skip)]
+    pub prefetched_kv: Option<(Tensor, Tensor)>,
 }
 
 impl Default for PrefixKVCacheManager {
@@ -175,7 +178,72 @@ impl PrefixKVCacheManager {
             anchor_cache: HashMap::new(),
             rolling_cache: HashMap::new(),
             step_counter: 0,
+            prefetched_kv: None,
         }
+    }
+
+    /// Store Anchor KV tensors for `layer_idx` (by value, mirroring Python `set_anchor_kv`).
+    pub fn set_anchor_kv(&mut self, layer_idx: usize, k: Tensor, v: Tensor) {
+        self.store_anchor_kv(layer_idx, &k, &v, None, None);
+    }
+
+    /// Store Rolling KV tensors for `layer_idx` (by value, mirroring Python `set_rolling_kv`).
+    pub fn set_rolling_kv(&mut self, layer_idx: usize, k: Tensor, v: Tensor) {
+        self.store_rolling_kv(layer_idx, &k, &v, None, None);
+    }
+
+    /// Check whether `layer_idx` has any cached prefix (mirroring Python `has_cache`).
+    pub fn has_cache(&self, layer_idx: usize) -> bool {
+        self.has_active_prefix(layer_idx)
+    }
+
+    /// Concatenate cached `[Anchor, Rolling]` KV tensors for `layer_idx` (mirroring Python `get_concat_kv`).
+    pub fn get_concat_kv(&self, layer_idx: usize, _stream: &str) -> Option<(Tensor, Tensor)> {
+        let mut k_parts: Vec<&Tensor> = Vec::new();
+        let mut v_parts: Vec<&Tensor> = Vec::new();
+
+        if self.config.use_anchor {
+            if let Some(anc) = self.anchor_cache.get(&layer_idx) {
+                k_parts.push(&anc.k);
+                v_parts.push(&anc.v);
+            }
+        }
+        if let Some(roll) = self.rolling_cache.get(&layer_idx) {
+            k_parts.push(&roll.k);
+            v_parts.push(&roll.v);
+        }
+        if k_parts.is_empty() {
+            return None;
+        }
+        if k_parts.len() == 1 {
+            return Some((k_parts[0].clone(), v_parts[0].clone()));
+        }
+        let seq_dim = if k_parts[0].ndim() == 4 { 2 } else { 1 };
+        let cat_k = Tensor::concat(&k_parts, seq_dim).ok()?;
+        let cat_v = Tensor::concat(&v_parts, seq_dim).ok()?;
+        Some((cat_k, cat_v))
+    }
+
+    /// Stage concatenated KV for `layer_idx` into the prefetch slot.
+    pub fn prefetch_layer(&mut self, layer_idx: usize, stream: &str) {
+        self.prefetched_kv = self.get_concat_kv(layer_idx, stream);
+    }
+
+    /// Consume and clear the prefetched KV slot.
+    pub fn consume_prefetched_kv(&mut self) -> Option<(Tensor, Tensor)> {
+        self.prefetched_kv.take()
+    }
+
+    /// Total cached bytes across all anchor and rolling KV entries (assuming `f32` = 4 bytes/element).
+    pub fn total_cached_bytes(&self) -> usize {
+        let mut total_elems = 0usize;
+        for entry in self.anchor_cache.values() {
+            total_elems += entry.k.numel() + entry.v.numel();
+        }
+        for entry in self.rolling_cache.values() {
+            total_elems += entry.k.numel() + entry.v.numel();
+        }
+        total_elems * 4
     }
 
     /// Store Anchor KV tensors for `layer_idx`.

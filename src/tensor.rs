@@ -79,6 +79,27 @@ impl Tensor {
         Self { shape: s, data }
     }
 
+    /// Creates a deterministic uniform `[0.0, 1.0)` tensor.
+    pub fn rand<S: AsRef<[usize]>>(shape: S, seed: u64) -> Self {
+        let s = shape.as_ref().to_vec();
+        let numel: usize = s.iter().product();
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut data = Vec::with_capacity(numel);
+        for _ in 0..numel {
+            data.push(rng.gen::<f32>());
+        }
+        Self { shape: s, data }
+    }
+
+    /// Arithmetic mean of all elements (or `0.0` if empty).
+    pub fn mean(&self) -> f32 {
+        if self.data.is_empty() {
+            0.0
+        } else {
+            self.data.iter().sum::<f32>() / (self.data.len() as f32)
+        }
+    }
+
     /// Number of dimensions.
     pub fn ndim(&self) -> usize {
         self.shape.len()
@@ -157,6 +178,14 @@ impl Tensor {
     /// Alias for [`Self::slice_axis`].
     pub fn slice_dim(&self, dim: usize, start: usize, end: usize) -> Result<Self> {
         self.slice_axis(dim, start, end)
+    }
+
+    /// Return a new tensor with every element multiplied by `factor`.
+    pub fn scale(&self, factor: f32) -> Self {
+        Self {
+            shape: self.shape.clone(),
+            data: self.data.iter().map(|&v| v * factor).collect(),
+        }
     }
 
     /// Concatenate multiple tensors along `dim`.
@@ -317,6 +346,17 @@ pub struct AvLatent {
 }
 
 impl AvLatent {
+    /// Create an [`AvLatent`] containing only a video latent.
+    pub fn from_video(video: Tensor) -> Self {
+        Self {
+            video: Some(video),
+            audio: None,
+            video_mask: None,
+            audio_mask: None,
+            metadata: HashMap::new(),
+        }
+    }
+
     /// Create an [`AvLatent`] containing both video and audio latents.
     pub fn from_video_audio(video: Tensor, audio: Tensor) -> Self {
         Self {

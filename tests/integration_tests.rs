@@ -525,7 +525,7 @@ fn test_nodes_end_to_end_pipeline() {
         true,
         false,
         "Native Masked AV",
-        0.015,
+        0.0,
         0.25,
         0.75,
     );

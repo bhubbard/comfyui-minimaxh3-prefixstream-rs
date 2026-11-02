@@ -20,10 +20,10 @@ use crate::engine::timeline_session_manager::{
     render_timeline_indicator_image, slice_video_and_audio, standardize_audio_dict, TimelineSession,
 };
 use crate::error::{PrefixStreamError, Result};
-use crate::pipeline::context_noise::encode_noisy_prefix;
+use crate::pipeline::context_noise::{encode_noisy_prefix, encode_noisy_prefix_with_plan};
 use crate::pipeline::disk_stream::append_disk_clip;
 use crate::pipeline::long_video_director::LongVideoSession;
-use crate::pipeline::native_masked_av::{apply_native_masked_av, MaskedAvPlan};
+use crate::pipeline::native_masked_av::{apply_native_masked_av, latent_boundaries, MaskedAvPlan};
 use crate::pipeline::seam_protector::{
     standardize_image_tensor, stitch_audio_latents, stitch_audio_waveforms, stitch_video_images,
     stitch_video_latents, trim_audio_latents, trim_images_and_audio, trim_prefix_frames,
@@ -152,6 +152,34 @@ impl MiniMaxPrefixCacheConfigNode {
         }
         session
     }
+
+    /// Create both a [`KVCacheConfig`] and [`LongVideoSession`] from concise parameters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn configure(
+        &self,
+        continuation_mode: &str,
+        rolling_frames: usize,
+        anchor_frames: usize,
+        use_anchor: bool,
+        rope_continuity: bool,
+        reference_noise_strength: f32,
+        reference_noise_correlation: f32,
+        reference_noise_end_scale: f32,
+    ) -> (KVCacheConfig, LongVideoSession) {
+        let sess = self.create_session(
+            rolling_frames,
+            use_anchor,
+            anchor_frames,
+            rope_continuity,
+            true,
+            false,
+            continuation_mode,
+            reference_noise_strength,
+            reference_noise_end_scale,
+            reference_noise_correlation,
+        );
+        (sess.config.clone(), sess)
+    }
 }
 
 /// Output from [`MiniMaxPrefixCacheApplierNode::apply_cache`].
@@ -219,8 +247,29 @@ impl MiniMaxPrefixCacheApplierNode {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize;
 
-        // Optional pixel-space reference noise re-encoding
-        if session.config.reference_noise_strength > 0.0 {
+        let is_native_masked_av = session
+            .config
+            .continuation_mode
+            .to_lowercase()
+            .contains("masked av");
+
+        let has_ref_noise = session.config.reference_noise_strength > 0.0;
+        if has_ref_noise && previous_latent.is_some() {
+            if !is_native_masked_av {
+                return Err(PrefixStreamError::InvalidInput(
+                    "Reference noise requires Native Masked AV mode".into(),
+                ));
+            }
+            if vae.is_none() {
+                return Err(PrefixStreamError::InvalidInput(
+                    "Reference noise requires an H3 video VAE".into(),
+                ));
+            }
+            if source_start_step != 0 {
+                return Err(PrefixStreamError::InvalidInput(
+                    "Reference noise requires a full untrimmed source latent (source_start_step == 0)".into(),
+                ));
+            }
             if let (Some(ref_imgs), Some(v_vae)) = (reference_frames, vae) {
                 let (noisy_lat, _) = encode_noisy_prefix(
                     v_vae,
@@ -235,49 +284,115 @@ impl MiniMaxPrefixCacheApplierNode {
             }
         }
 
-        let is_native_masked_av = session
-            .config
-            .continuation_mode
-            .to_lowercase()
-            .contains("masked av");
-
         if is_native_masked_av {
             if let (Some(ref src_v), Some(ref src_a), Some(tgt)) = (&prev_v, &prev_a, target_latent)
             {
                 if let (Some(ref tgt_v), Some(ref tgt_a)) = (&tgt.video, &tgt.audio) {
-                    let res = apply_native_masked_av(
+                    let effective_feather = if has_ref_noise {
+                        0
+                    } else {
+                        audio_feather_ticks
+                    };
+                    let masked_res = apply_native_masked_av(
                         tgt_v,
                         tgt_a,
                         src_v,
                         src_a,
                         session.config.rolling_frames,
                         audio_tail_carryover,
-                        audio_feather_ticks,
+                        effective_feather,
                         source_start_step,
                         source_audio_start_tick,
                         video_context_denoise,
-                    )?;
-
-                    session.last_rolling_steps = res.plan.context_steps;
-                    session.last_rolling_frames = res.plan.actual_context_frames;
-                    session.is_current_clip_trimmed = false;
-
-                    let mut out_lat =
-                        AvLatent::from_video_audio(res.video_latent, res.audio_latent);
-                    out_lat.video_mask = Some(res.video_mask);
-                    out_lat.audio_mask = Some(res.audio_mask);
-                    out_lat.metadata.insert(
-                        "minimax_masked_av_plan".to_string(),
-                        serde_json::to_value(&res.plan).unwrap_or(Value::Null),
                     );
 
-                    return Ok(ApplierOutput {
-                        conditioning: conditioning.to_vec(),
-                        latent: Some(out_lat),
-                        anchor_image: primary_anchor,
-                        identity_references: prepared_refs,
-                        masked_av_plan: Some(res.plan),
-                    });
+                    match masked_res {
+                        Ok(mut res) => {
+                            if has_ref_noise && reference_frames.is_none() {
+                                if let Some(v_vae) = vae {
+                                    let noisy_prefix = encode_noisy_prefix_with_plan(
+                                        v_vae,
+                                        src_v,
+                                        &res.plan,
+                                        session.config.reference_noise_strength,
+                                        seed,
+                                    )?;
+                                    let c_dim = res.video_latent.shape[1];
+                                    let t_dim = res.video_latent.shape[2];
+                                    let h_dim = res.video_latent.shape[3];
+                                    let w_dim = res.video_latent.shape[4];
+                                    let steps = res.plan.context_steps;
+                                    for c_i in 0..c_dim {
+                                        for t_i in 0..steps {
+                                            for h_i in 0..h_dim {
+                                                for w_i in 0..w_dim {
+                                                    let dst_idx = (((c_i * t_dim) + t_i) * h_dim
+                                                        + h_i)
+                                                        * w_dim
+                                                        + w_i;
+                                                    let src_idx = (((c_i * steps) + t_i) * h_dim
+                                                        + h_i)
+                                                        * w_dim
+                                                        + w_i;
+                                                    res.video_latent.data[dst_idx] =
+                                                        noisy_prefix.data[src_idx];
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            session.last_rolling_steps = res.plan.context_steps;
+                            session.last_rolling_frames = res.plan.actual_context_frames;
+                            session.is_current_clip_trimmed = false;
+
+                            let mut out_lat =
+                                AvLatent::from_video_audio(res.video_latent, res.audio_latent);
+                            out_lat.video_mask = Some(res.video_mask);
+                            out_lat.audio_mask = Some(res.audio_mask);
+                            out_lat.metadata.insert(
+                                "minimax_masked_av_plan".to_string(),
+                                serde_json::to_value(&res.plan).unwrap_or(Value::Null),
+                            );
+                            out_lat.metadata.insert(
+                                "minimax_prefix_frames".to_string(),
+                                json!(res.plan.actual_context_frames),
+                            );
+
+                            // Drop head keyframes colliding with protected masked prefix
+                            let protected_frames = res.plan.actual_context_frames;
+                            let out_cond: Vec<ConditioningEntry> = conditioning
+                                .iter()
+                                .map(|entry| {
+                                    let mut cloned = entry.clone();
+                                    cloned.minimax_keyframes.retain(|kf| {
+                                        kf.resolved_frame_index >= protected_frames as f32
+                                    });
+                                    cloned
+                                })
+                                .collect();
+
+                            return Ok(ApplierOutput {
+                                conditioning: out_cond,
+                                latent: Some(out_lat),
+                                anchor_image: primary_anchor,
+                                identity_references: prepared_refs,
+                                masked_av_plan: Some(res.plan),
+                            });
+                        }
+                        Err(err) => {
+                            let msg = err.to_string();
+                            let is_geometry_fallback = !has_ref_noise
+                                && (msg.contains("at least 5 source frames")
+                                    || msg.contains("consume the whole target")
+                                    || msg.contains("has no phase-aligned"));
+                            if !is_geometry_fallback {
+                                return Err(err);
+                            }
+                            // Fall through to Safe Native fallback below
+                        }
+                    }
                 }
             }
         }
@@ -301,11 +416,151 @@ impl MiniMaxPrefixCacheApplierNode {
     }
 }
 
+/// Output from [`MiniMaxTrimPrefixLatentNode::trim_frames`].
+#[derive(Debug, Clone)]
+pub struct TrimOutput {
+    /// Trimmed images `[F_rem, H, W, C]`.
+    pub images: Option<Tensor>,
+    /// Trimmed audio waveform.
+    pub audio: Option<AudioData>,
+    /// Trimmed AV latent with updated `minimax_source_start_step` and `minimax_source_audio_start_tick`.
+    pub latent: Option<AvLatent>,
+}
+
 /// 3. `MiniMaxTrimPrefixLatent`: Trims leading prefix latent steps (or decoded frames/audio).
 #[derive(Debug, Clone, Default)]
 pub struct MiniMaxTrimPrefixLatentNode;
 
 impl MiniMaxTrimPrefixLatentNode {
+    /// Trim leading `trim_frames` from pixel `images`, waveform `audio`, and/or `latent`,
+    /// mirroring Python `MiniMaxTrimPrefixLatentNode.trim`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn trim_frames(
+        &self,
+        trim_frames: usize,
+        images: Option<&Tensor>,
+        audio: Option<&AudioData>,
+        latent: Option<&AvLatent>,
+        mut session: Option<&mut LongVideoSession>,
+        cache_config: Option<&KVCacheConfig>,
+        fps: f32,
+        match_tail: bool,
+    ) -> Result<TrimOutput> {
+        let mut actual_trim_frames = trim_frames;
+        if actual_trim_frames == 0 {
+            if let Some(ref s) = session {
+                actual_trim_frames = s.last_rolling_frames;
+            } else if let Some(cfg) = cache_config {
+                let has_noise_mask = latent
+                    .map(|l| l.video_mask.is_some() || l.audio_mask.is_some())
+                    .unwrap_or(false);
+                if has_noise_mask {
+                    actual_trim_frames = latent
+                        .and_then(|l| l.metadata.get("minimax_prefix_frames"))
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize)
+                        .unwrap_or(cfg.rolling_frames);
+                } else {
+                    actual_trim_frames = 0;
+                }
+            }
+        }
+
+        let (out_images, out_audio) = if let Some(imgs) = images {
+            let (ti, ta) = trim_images_and_audio(imgs, audio, actual_trim_frames, fps, match_tail)?;
+            (Some(ti), ta)
+        } else if let Some(aud) = audio {
+            let sr = aud.sample_rate as f64;
+            let head = ((actual_trim_frames as f64) / (fps as f64) * sr).round_ties_even() as usize;
+            let total_s = aud.waveform.shape[2];
+            let sliced = aud.waveform.slice_axis(2, head.min(total_s), total_s)?;
+            (
+                None,
+                Some(AudioData {
+                    waveform: sliced,
+                    sample_rate: aud.sample_rate,
+                }),
+            )
+        } else {
+            (None, None)
+        };
+
+        if actual_trim_frames > 0 {
+            if let Some(ref mut s) = session {
+                s.is_current_clip_trimmed = true;
+            }
+        }
+
+        let out_latent = if let Some(target_latent) = latent {
+            let mut cloned = target_latent.clone();
+            if let Some(ref v) = target_latent.video {
+                let source_step = target_latent
+                    .metadata
+                    .get("minimax_source_start_step")
+                    .and_then(|val| val.as_u64())
+                    .unwrap_or(0) as usize;
+                let mut trim_steps = 0usize;
+                if actual_trim_frames > 0 {
+                    let bounds = latent_boundaries(v.shape[2], source_step);
+                    trim_steps = bounds
+                        .iter()
+                        .position(|&end| end >= actual_trim_frames)
+                        .unwrap_or(v.shape[2]);
+                }
+                if trim_steps > 0 {
+                    let trimmed_v = v.slice_axis(2, trim_steps.min(v.shape[2]), v.shape[2])?;
+                    cloned.video = Some(trimmed_v);
+                    let mut audio_trim_steps = 0usize;
+                    if let Some(ref a) = target_latent.audio {
+                        let end_frame = *latent_boundaries(source_step + trim_steps, 0)
+                            .last()
+                            .unwrap_or(&0);
+                        let audio_origin = target_latent
+                            .metadata
+                            .get("minimax_source_audio_start_tick")
+                            .and_then(|val| val.as_u64())
+                            .unwrap_or(0) as usize;
+                        let target_tick =
+                            ((end_frame as f64) * 40.0 / 24.0).round_ties_even() as usize;
+                        let last_dim = a.ndim() - 1;
+                        audio_trim_steps = target_tick
+                            .saturating_sub(audio_origin)
+                            .min(a.shape[last_dim]);
+                        cloned.audio =
+                            Some(a.slice_axis(last_dim, audio_trim_steps, a.shape[last_dim])?);
+                    }
+                    cloned.metadata.insert(
+                        "minimax_source_start_step".to_string(),
+                        json!(source_step + trim_steps.min(v.shape[2])),
+                    );
+                    let prev_audio_origin = target_latent
+                        .metadata
+                        .get("minimax_source_audio_start_tick")
+                        .and_then(|val| val.as_u64())
+                        .unwrap_or(0) as usize;
+                    cloned.metadata.insert(
+                        "minimax_source_audio_start_tick".to_string(),
+                        json!(prev_audio_origin + audio_trim_steps),
+                    );
+                    cloned.video_mask = None;
+                    cloned.audio_mask = None;
+                    cloned
+                        .metadata
+                        .insert("minimax_prefix_frames".to_string(), json!(0));
+                }
+            }
+            Some(cloned)
+        } else {
+            None
+        };
+
+        Ok(TrimOutput {
+            images: out_images,
+            audio: out_audio,
+            latent: out_latent,
+        })
+    }
+
     /// Trim prefix latent steps from `samples` and/or leading frames from `images` & `audio`.
     pub fn trim(
         &self,

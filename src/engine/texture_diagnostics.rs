@@ -149,18 +149,15 @@ fn dft_1d(re_in: &[f64], im_in: &[f64], out_re: &mut [f64], out_im: &mut [f64]) 
     }
 }
 
-/// Compute 2D real-to-complex power spectrum `|FFT2(windowed)|^2 / (H * W * window_power)`
-/// for unique `rfft2` frequencies `kx in 0..=W/2` and `ky in 0..H`.
-fn rfft2_normalized_power(
+/// Compute full 2D FFT power spectrum `|FFT2(windowed)|^2` for `[H, W]` real input.
+fn fft2_power_spectrum(
     detrended: &[f64],
     height: usize,
     width: usize,
     window_2d: &[f64],
-    window_power: f64,
 ) -> Vec<f64> {
-    let rfft_w = width / 2 + 1;
-    let mut row_fft_re = vec![0.0_f64; height * rfft_w];
-    let mut row_fft_im = vec![0.0_f64; height * rfft_w];
+    let mut row_fft_re = vec![0.0_f64; height * width];
+    let mut row_fft_im = vec![0.0_f64; height * width];
 
     let mut in_re = vec![0.0_f64; width];
     let mut in_im = vec![0.0_f64; width];
@@ -173,9 +170,9 @@ fn rfft2_normalized_power(
             in_im[c] = 0.0;
         }
         dft_1d(&in_re, &in_im, &mut out_re, &mut out_im);
-        for c in 0..rfft_w {
-            row_fft_re[r * rfft_w + c] = out_re[c];
-            row_fft_im[r * rfft_w + c] = out_im[c];
+        for c in 0..width {
+            row_fft_re[r * width + c] = out_re[c];
+            row_fft_im[r * width + c] = out_im[c];
         }
     }
 
@@ -184,18 +181,17 @@ fn rfft2_normalized_power(
     let mut col_out_re = vec![0.0_f64; height];
     let mut col_out_im = vec![0.0_f64; height];
 
-    let norm_denom = (height * width) as f64 * window_power;
-    let mut power = vec![0.0_f64; height * rfft_w];
+    let mut power = vec![0.0_f64; height * width];
 
-    for c in 0..rfft_w {
+    for c in 0..width {
         for r in 0..height {
-            col_in_re[r] = row_fft_re[r * rfft_w + c];
-            col_in_im[r] = row_fft_im[r * rfft_w + c];
+            col_in_re[r] = row_fft_re[r * width + c];
+            col_in_im[r] = row_fft_im[r * width + c];
         }
         dft_1d(&col_in_re, &col_in_im, &mut col_out_re, &mut col_out_im);
         for r in 0..height {
             let mag_sq = col_out_re[r] * col_out_re[r] + col_out_im[r] * col_out_im[r];
-            power[r * rfft_w + c] = mag_sq / norm_denom;
+            power[r * width + c] = mag_sq;
         }
     }
 
@@ -207,7 +203,7 @@ fn rfft2_normalized_power(
 /// Mirrors `texture_band_rms` in `engine/texture_diagnostics.py`.
 ///
 /// # Arguments
-/// * `images` - `[F, H, W, C]` float tensor in `[0, 1]` with `C >= 3`.
+/// * `images` - `[H, W, C]` or `[F, H, W, C]` float tensor with `C >= 3` and `min(H, W) >= 4`.
 /// * `bands` - Optional custom radial wavelength bands `(label, min_wavelength_px, max_wavelength_px)`.
 ///
 /// # Returns
@@ -216,18 +212,29 @@ pub fn texture_band_rms(
     images: &Tensor,
     bands: Option<&[(&str, f64, f64)]>,
 ) -> Result<HashMap<String, HashMap<String, Vec<f64>>>> {
-    if images.ndim() != 4 || images.shape[3] < 3 {
-        return Err(PrefixStreamError::InvalidInput(format!(
-            "images must have shape [F, H, W, C>=3], got {:?}",
-            images.shape
-        )));
+    let (frames, height, width, channels) = match images.ndim() {
+        3 => (1, images.shape[0], images.shape[1], images.shape[2]),
+        4 => (
+            images.shape[0],
+            images.shape[1],
+            images.shape[2],
+            images.shape[3],
+        ),
+        _ => {
+            return Err(PrefixStreamError::InvalidInput(format!(
+                "Expected an RGB image region [H, W, C] or [F, H, W, C], got {:?}",
+                images.shape
+            )))
+        }
+    };
+
+    if channels < 3 || height.min(width) < 4 {
+        return Err(PrefixStreamError::InvalidInput(
+            "Expected an RGB image region with height and width >= 4 and channels >= 3".into(),
+        ));
     }
 
     let active_bands = bands.unwrap_or(&DEFAULT_BANDS);
-    let frames = images.shape[0];
-    let height = images.shape[1];
-    let width = images.shape[2];
-    let channels = images.shape[3];
 
     let win_y: Vec<f64> = (0..height)
         .map(|i| {
@@ -258,21 +265,22 @@ pub fn texture_band_rms(
         }
     }
     let window_power = (window_power_sum / ((height * width) as f64)).max(1e-12);
+    let normalizer = ((height * width) as f64).powi(2) * window_power;
 
-    let rfft_w = width / 2 + 1;
-    let mut wavelength_grid = vec![f64::INFINITY; height * rfft_w];
+    let mut radius_grid = vec![0.0_f64; height * width];
     for r in 0..height {
         let fy = if r <= (height - 1) / 2 {
             (r as f64) / (height as f64)
         } else {
             ((r as isize - height as isize) as f64) / (height as f64)
         };
-        for c in 0..rfft_w {
-            let fx = (c as f64) / (width as f64);
-            let radial_freq = (fx * fx + fy * fy).sqrt();
-            if radial_freq > 0.0 {
-                wavelength_grid[r * rfft_w + c] = 1.0 / radial_freq;
-            }
+        for c in 0..width {
+            let fx = if c <= (width - 1) / 2 {
+                (c as f64) / (width as f64)
+            } else {
+                ((c as isize - width as isize) as f64) / (width as f64)
+            };
+            radius_grid[r * width + c] = (fx * fx + fy * fy).sqrt();
         }
     }
 
@@ -299,7 +307,12 @@ pub fn texture_band_rms(
             let r = images.data[p] as f64;
             let g = images.data[p + 1] as f64;
             let b = images.data[p + 2] as f64;
-            luma[idx] = 0.299 * r + 0.587 * g + 0.114 * b;
+            if !r.is_finite() || !g.is_finite() || !b.is_finite() {
+                return Err(PrefixStreamError::InvalidInput(
+                    "Image region contains non-finite values".into(),
+                ));
+            }
+            luma[idx] = 0.2126 * r + 0.7152 * g + 0.0722 * b;
             rg[idx] = r - g;
             bg[idx] = b - g;
         }
@@ -312,24 +325,20 @@ pub fn texture_band_rms(
 
         for (ch_name, buf) in channel_buffers {
             let detrended = remove_linear_trend(&buf, height, width);
-            let power = rfft2_normalized_power(&detrended, height, width, &window_2d, window_power);
+            let power = fft2_power_spectrum(&detrended, height, width, &window_2d);
             let ch_entry = result.get_mut(ch_name).unwrap();
 
             for (label, min_wl, max_wl) in active_bands {
                 let mut sum_p = 0.0_f64;
-                let mut count = 0usize;
-                for i in 0..(height * rfft_w) {
-                    let wl = wavelength_grid[i];
-                    if wl >= *min_wl && wl < *max_wl {
+                let lo_freq = 1.0 / *max_wl;
+                let hi_freq = 1.0 / *min_wl;
+                for i in 0..(height * width) {
+                    let rad = radius_grid[i];
+                    if rad >= lo_freq && rad < hi_freq {
                         sum_p += power[i];
-                        count += 1;
                     }
                 }
-                let rms = if count > 0 {
-                    (sum_p / (count as f64)).sqrt()
-                } else {
-                    0.0
-                };
+                let rms = (sum_p / normalizer).sqrt();
                 if let Some(vec) = ch_entry.get_mut(*label) {
                     vec.push(rms);
                 }
