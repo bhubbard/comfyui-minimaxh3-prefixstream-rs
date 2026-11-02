@@ -1,0 +1,38 @@
+[package]
+name = "comfyui-minimaxh3-prefixstream"
+version = "0.1.0"
+edition = "2021"
+authors = ["Brandon Hubbard <bhubbard@users.noreply.github.com>"]
+description = "High-performance pure Rust port of ComfyUI-MiniMaxH3-PrefixStream — Native Masked AV long-video continuation, H3 17k+5 spatiotemporal phase-grid alignment, zero-flicker pixel/waveform seam stitching, Clip Bin DAG media pool, and lazy FFmpeg timeline slicer/reassembler."
+repository = "https://github.com/bhubbard/comfyui-minimaxh3-prefixstream-rs"
+homepage = "https://code.brandonhubbard.com/comfyui-minimaxh3-prefixstream-rs/"
+documentation = "https://code.brandonhubbard.com/comfyui-minimaxh3-prefixstream-rs/"
+license = "MIT"
+readme = "README.md"
+keywords = ["minimax-h3", "comfyui", "video-generation", "diffusion", "prefix-stream"]
+categories = ["multimedia::video", "multimedia::audio", "science", "command-line-utilities"]
+
+[lib]
+name = "minimaxh3_prefixstream"
+path = "src/lib.rs"
+
+[[bin]]
+name = "minimax-prefixstream"
+path = "src/bin/minimax_prefixstream.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env", "cargo"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+anyhow = "1.0"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+safetensors = "0.6"
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1.11"
+rand = "0.8"
+uuid = { version = "1.10", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.15"
+approx = "0.5"

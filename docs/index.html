@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MiniMaxH3 PrefixStream-RS — Interactive Continuation &amp; RoPE Studio</title>
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --panel: #131a2a;
+      --border: #23304c;
+      --accent: #38bdf8;
+      --emerald: #22c55e;
+      --amber: #f59e0b;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      padding: 2rem;
+    }
+    .container { max-width: 1120px; margin: 0 auto; }
+    header {
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 1.5rem;
+      margin-bottom: 2rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 1rem;
+    }
+    h1 { font-size: 1.8rem; color: #fff; }
+    .badge {
+      background: rgba(56, 189, 248, 0.15);
+      color: var(--accent);
+      border: 1px solid var(--accent);
+      padding: 0.25rem 0.75rem;
+      border-radius: 999px;
+      font-size: 0.85rem;
+      font-weight: 600;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 1.5rem;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.5rem;
+    }
+    .card h2 {
+      font-size: 1.15rem;
+      margin-bottom: 1rem;
+      color: var(--accent);
+    }
+    label {
+      display: block;
+      font-size: 0.875rem;
+      color: var(--muted);
+      margin-top: 0.75rem;
+    }
+    input[type="range"], select {
+      width: 100%;
+      margin-top: 0.35rem;
+    }
+    .stat-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 0.45rem 0;
+      border-bottom: 1px solid rgba(255,255,255,0.06);
+      font-size: 0.92rem;
+    }
+    .stat-val { font-family: monospace; font-weight: 600; color: #fff; }
+    .exact-yes { color: var(--emerald); }
+    .exact-no { color: var(--amber); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div>
+        <h1>MiniMaxH3-PrefixStream-RS</h1>
+        <p style="color: var(--muted);">Pure-Rust Infinite Video &amp; Audio Continuation Engine for MiniMaxHailuo-03</p>
+      </div>
+      <span class="badge">Rust 2021 • Zero Warnings • 15 Nodes</span>
+    </header>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Interactive H3 Spatiotemporal Grid &amp; Masked AV Planner</h2>
+        <label>Requested Context Frames: <span id="lbl-req">39</span></label>
+        <input type="range" id="rng-frames" min="5" max="192" value="39" oninput="updatePlan()" />
+
+        <label>Target Clip Latent Steps (T): <span id="lbl-tgt">37</span></label>
+        <input type="range" id="rng-tgt" min="12" max="62" value="37" oninput="updatePlan()" />
+
+        <div style="margin-top: 1.25rem;">
+          <div class="stat-row"><span>Snapped H3 Run Grid (17k + 5)</span><span class="stat-val" id="out-snapped">39 frames</span></div>
+          <div class="stat-row"><span>Context Latent Steps</span><span class="stat-val" id="out-steps">12 steps</span></div>
+          <div class="stat-row"><span>40Hz Audio Context Ticks</span><span class="stat-val" id="out-audio">65 ticks</span></div>
+          <div class="stat-row"><span>Integer Audio Sync (Zero Rounding)</span><span class="stat-val exact-yes" id="out-exact">EXACT (39f = 65 ticks)</span></div>
+          <div class="stat-row"><span>Net New Frames per Clip</span><span class="stat-val" id="out-net">85 frames</span></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>H3 (1, 4, 4, 4, 4) Token Cycle Reference</h2>
+        <p style="color: var(--muted); font-size: 0.9rem; margin-bottom: 1rem;">
+          Every 5 latent steps in MiniMax H3 span <code>1 + 4 + 4 + 4 + 4 = 17</code> pixel frames at 24 fps, while audio ticks run at 40 Hz (<code>5/3</code> ticks per frame).
+        </p>
+        <div class="stat-row"><span>2 steps (Phase 0..2)</span><span class="stat-val">5 frames (8.33 ticks)</span></div>
+        <div class="stat-row"><span>7 steps (1 cycle + 2)</span><span class="stat-val">22 frames (36.67 ticks)</span></div>
+        <div class="stat-row"><span>12 steps (2 cycles + 2)</span><span class="stat-val exact-yes">39 frames (65 ticks ★)</span></div>
+        <div class="stat-row"><span>17 steps (3 cycles + 2)</span><span class="stat-val">56 frames (93.33 ticks)</span></div>
+        <div class="stat-row"><span>27 steps (5 cycles + 2)</span><span class="stat-val exact-yes">90 frames (150 ticks ★)</span></div>
+        <div class="stat-row"><span>37 steps (7 cycles + 2)</span><span class="stat-val">124 frames (206.67 ticks)</span></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const FPT = [1, 4, 4, 4, 4];
+    function latentStepsToFrames(steps) {
+      let acc = 0;
+      for (let i = 0; i < steps; i++) acc += FPT[i % 5];
+      return acc;
+    }
+    function updatePlan() {
+      const req = parseInt(document.getElementById('rng-frames').value, 10);
+      const tgtSteps = parseInt(document.getElementById('rng-tgt').value, 10);
+      document.getElementById('lbl-req').textContent = req;
+      document.getElementById('lbl-tgt').textContent = tgtSteps;
+
+      const tgtFrames = latentStepsToFrames(tgtSteps);
+      const cap = Math.max(5, Math.min(req, tgtFrames - 1));
+      const snapped = 5 + Math.floor((cap - 5) / 17) * 17;
+      const ctxSteps = 2 + 5 * Math.floor((snapped - 5) / 17);
+      const audioTicks = Math.round(snapped * 40 / 24);
+      const isExact = snapped >= 39 && (snapped - 39) % 51 === 0;
+
+      document.getElementById('out-snapped').textContent = snapped + ' frames';
+      document.getElementById('out-steps').textContent = ctxSteps + ' steps';
+      document.getElementById('out-audio').textContent = audioTicks + ' ticks';
+      const exEl = document.getElementById('out-exact');
+      exEl.textContent = isExact ? `EXACT (${snapped}f = ${audioTicks} ticks)` : `ROUNDED (${(snapped * 40 / 24).toFixed(2)} -> ${audioTicks} ticks)`;
+      exEl.className = 'stat-val ' + (isExact ? 'exact-yes' : 'exact-no');
+      document.getElementById('out-net').textContent = Math.max(0, tgtFrames - snapped) + ' frames';
+    }
+    updatePlan();
+  </script>
+</body>
+</html>

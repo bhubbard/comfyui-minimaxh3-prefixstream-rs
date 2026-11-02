@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.safetensors
+*.mp4
+*.mkv
+*.wav
+output/
+temp/
+.DS_Store
